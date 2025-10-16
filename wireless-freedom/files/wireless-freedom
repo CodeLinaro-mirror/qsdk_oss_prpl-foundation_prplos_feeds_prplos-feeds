@@ -1,0 +1,31 @@
+#!/bin/sh
+
+wait_for_uci_wireless() {
+	local timeout=10
+	local elapsed=0
+	local uci_detect
+
+	uci_detect=$(uci show wireless > /dev/null 2>/dev/null;echo $?)
+
+	while [ "$uci_detect" -ne "0" ] && [ $elapsed -lt $timeout ]; do
+		uci_detect=$(uci show wireless > /dev/null 2>/dev/null;echo $?)
+		elapsed=$((elapsed + 1))
+		sleep 1
+	done
+}
+
+init_vendor_uci_wireless() {
+	uci get wireless.vendor 1>/dev/null 2>/dev/null || {
+		uci set wireless.vendor=vendor
+	}
+
+	uci  set wireless.vendor.min_phy=3
+	uci  set wireless.vendor.phy_detect_timeout=10
+	uci commit wireless
+}
+
+wait_for_uci_wireless
+init_vendor_uci_wireless
+
+exit 0
+
