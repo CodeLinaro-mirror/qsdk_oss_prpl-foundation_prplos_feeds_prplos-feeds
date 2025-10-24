@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=netifd-scripts
 PKG_VERSION:=1.0
-
+PKG_LICENSE:=GPL-2.0-only
 include $(INCLUDE_DIR)/package.mk
 
 define Package/netifd-scripts
