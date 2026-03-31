@@ -6,10 +6,11 @@ wait_for_uci_wireless() {
 	local uci_detect
 	local min_phy
 
-	uci_detect=$(uci show wireless > /dev/null 2>/dev/null;echo $?)
+	uci_detect=$(uci show wireless |grep wifi-device | wc -l)
 	min_phy=$(ls /sys/kernel/debug/ath12k/ |wc -l)
 	while [ "$uci_detect" -lt "$min_phy" ] && [ $elapsed -lt $timeout ]; do
-		uci_detect=$(uci show wireless > /dev/null 2>/dev/null;echo $?)
+		min_phy=$(ls /sys/kernel/debug/ath12k/ |wc -l)
+		uci_detect=$(uci show wireless |grep wifi-device | wc -l)
 		elapsed=$((elapsed + 1))
 		sleep 1
 	done
