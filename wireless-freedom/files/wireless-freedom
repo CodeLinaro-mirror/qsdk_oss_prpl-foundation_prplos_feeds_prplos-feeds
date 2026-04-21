@@ -1,15 +1,18 @@
 #!/bin/sh
 
 wait_for_uci_wireless() {
-	local timeout=10
+	local timeout=30
 	local elapsed=0
 	local uci_detect
+	local min_phy
 
-	uci_detect=$(uci show wireless > /dev/null 2>/dev/null;echo $?)
-
-	while [ "$uci_detect" -ne "0" ] && [ $elapsed -lt $timeout ]; do
-		uci_detect=$(uci show wireless > /dev/null 2>/dev/null;echo $?)
+	uci_detect=$(uci show wireless |grep wifi-device | wc -l)
+	min_phy=$(ls /sys/kernel/debug/ath12k/ | grep -E "^(pci|ahb)" | wc -l)
+	while [ "$uci_detect" -lt "$min_phy" ] && [ $elapsed -lt $timeout ]; do
+		min_phy=$(ls /sys/kernel/debug/ath12k/ | grep -E "^(pci|ahb)" | wc -l)
+		uci_detect=$(uci show wireless |grep wifi-device | wc -l)
 		elapsed=$((elapsed + 1))
+		[ "$elapsed" -gt 28 ] && [ "$min_phy" -lt 2 ] && /sbin/wifi config
 		sleep 1
 	done
 }
@@ -18,9 +21,10 @@ init_vendor_uci_wireless() {
 	uci get wireless.vendor 1>/dev/null 2>/dev/null || {
 		uci set wireless.vendor=vendor
 	}
-
-	uci  set wireless.vendor.min_phy=3
-	uci  set wireless.vendor.phy_detect_timeout=10
+	min_phy=$(ls /sys/kernel/debug/ath12k/ | grep -E "^(pci|ahb)" | wc -l)
+	[ "$min_phy" -lt 2 ] && min_phy=2
+	uci  set wireless.vendor.min_phy=$min_phy
+	uci  set wireless.vendor.phy_detect_timeout=20
 	uci commit wireless
 }
 
