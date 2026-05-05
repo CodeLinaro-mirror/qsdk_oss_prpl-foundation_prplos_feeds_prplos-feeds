@@ -12,6 +12,7 @@ wait_for_uci_wireless() {
 		min_phy=$(ls /sys/kernel/debug/ath12k/ |wc -l)
 		uci_detect=$(uci show wireless |grep wifi-device | wc -l)
 		elapsed=$((elapsed + 1))
+		[ "$elapsed" -gt 28 ] && [ "$min_phy" -lt 2 ] && /sbin/wifi config
 		sleep 1
 	done
 }
@@ -21,6 +22,7 @@ init_vendor_uci_wireless() {
 		uci set wireless.vendor=vendor
 	}
 	min_phy=$(ls /sys/kernel/debug/ath12k/ |wc -l)
+	[ "$min_phy" -lt 2 ] && min_phy=2
 	uci  set wireless.vendor.min_phy=$min_phy
 	uci  set wireless.vendor.phy_detect_timeout=20
 	uci commit wireless
