@@ -1,0 +1,31 @@
+#!/usr/bin/amxrt
+
+/*
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: ISC
+ */
+
+%config {
+    name = "energyservice";
+    storage-path = "${rw_data_path}/${name}/";
+    odl = {
+        load-dm-events = false,
+        dm-save = true,
+        dm-save-on-changed = true,
+        dm-save-delay = 1000,
+        directory = "${storage-path}/odl"
+    };
+    usp = {
+        registrations = [ "EnergyService." ]
+    };
+    definition_file = "${name}_definition.odl";
+    defaults_file = "${name}_defaults.odl";
+}
+
+import "${name}.so" as "${name}";
+include "${definition_file}";
+?include "${storage-path}/odl/":"${defaults_file}";
+
+%define {
+    entry-point energyservice.energyservice_main;
+}
