@@ -10,6 +10,7 @@
 #include <amxd/amxd_action.h>
 #include <amxd/amxd_function.h>
 #include <amxd/amxd_object.h>
+#include <amxd/amxd_object_event.h>
 #include <amxd/amxd_object_parameter.h>
 #include <amxd/amxd_dm.h>
 #include <amxd/amxd_parameter.h>
@@ -630,11 +631,51 @@ static bool is_command_parameter(amxd_object_t* object, amxd_param_t* parameter)
     return false;
 }
 
+static void store_last_erp_command(const char* command) {
+    amxd_object_t* root = energy_root();
+    amxd_param_t* parameter;
+    const amxc_var_t* current_value;
+    amxc_var_t previous_value;
+    amxc_var_t old_values;
+    amxc_var_t value;
+    amxd_status_t status = amxd_status_unknown_error;
+
+    if(root == NULL || command == NULL) {
+        SAH_TRACEZ_WARNING(ME, "Failed to store the last ERP command");
+        return;
+    }
+
+    parameter = amxd_object_get_param_def(root, "LastERPServiceCommand");
+    current_value = amxd_object_get_param_value(root, "LastERPServiceCommand");
+    amxc_var_init(&previous_value);
+    amxc_var_init(&old_values);
+    amxc_var_init(&value);
+    if(parameter != NULL && current_value != NULL &&
+       amxc_var_copy(&previous_value, current_value) == 0 &&
+       amxc_var_set_type(&old_values, AMXC_VAR_ID_HTABLE) == 0 &&
+       amxc_var_set_key(&old_values, "LastERPServiceCommand", &previous_value,
+                        AMXC_VAR_FLAG_COPY) == 0 &&
+       amxc_var_set(cstring_t, &value, command) == 0) {
+        /* Update the runtime value internally while keeping the DM parameter
+         * read-only to external callers. */
+        status = amxc_var_copy(&parameter->value, &value) == 0 ?
+                     amxd_status_ok : amxd_status_unknown_error;
+        if(status == amxd_status_ok) {
+            /* Notify amxrt so the persistent ODL store is updated. */
+            amxd_object_trigger_changed(root, &old_values);
+        }
+    }
+    amxc_var_clean(&previous_value);
+    amxc_var_clean(&old_values);
+    amxc_var_clean(&value);
+    if(status != amxd_status_ok) {
+        SAH_TRACEZ_WARNING(ME, "Failed to store the last ERP command (status %d)", status);
+    }
+}
+
 /*
- * The Energy App worker is optional while the DM/configuration part is being
- * validated.  Try to control it when it is installed, but never make the DM
- * write fail just because the worker init script is absent or returns an
- * error.
+ * The Energy App worker is owned by the ERP init script. Keep the DM
+ * operation best-effort so a missing ERP service does not break DM writes.
  */
 static void worker_command_best_effort(const char* action) {
     char command[128];
@@ -643,10 +684,11 @@ static void worker_command_best_effort(const char* action) {
     if(action == NULL) {
         return;
     }
-    snprintf(command, sizeof(command), "%s %s >/dev/null 2>&1", WORKER_INIT, action);
+    (void) snprintf(command, sizeof(command), "%s %s >/dev/null 2>&1",
+                    WORKER_INIT, action);
     result = system(command);
     if(result == -1 || !WIFEXITED(result) || WEXITSTATUS(result) != 0) {
-        SAH_TRACEZ_WARNING(ME, "Worker command unavailable/failed; continuing: %s %s",
+        SAH_TRACEZ_WARNING(ME, "Worker command unavailable/failed: %s %s",
                            WORKER_INIT, action);
     }
 }
@@ -698,6 +740,9 @@ static amxd_status_t execute_erp_cli_parameter(amxd_object_t* object,
     }
 
     status = amxd_action_param_write(object, parameter, reason, args, retval, priv);
+    if(status == amxd_status_ok) {
+        store_last_erp_command(command);
+    }
     return status;
 }
 
@@ -721,7 +766,7 @@ ENERGY_EXPORT amxd_status_t _energyservice_erp_exit(amxd_object_t* object,
                                       "erp cli exit");
 }
 
-ENERGY_EXPORT amxd_status_t _energyservice_status_refresh(amxd_object_t* object,
+ENERGY_EXPORT amxd_status_t _energyservice_status(amxd_object_t* object,
                                              amxd_function_t* function,
                                              amxc_var_t* args,
                                              amxc_var_t* retval) {
@@ -767,10 +812,14 @@ ENERGY_EXPORT int _energyservice_main(int reason, amxd_dm_t* dm, amxo_parser_t* 
     energy_dm = dm;
     if(reason == AMXO_START) {
         if(service_is_started(energy_root())) {
-            (void) write_config(energy_root());
+            if(write_config(energy_root())) {
+                worker_command_best_effort("start");
+            }
         } else {
             remove_config();
         }
+    } else if(reason == AMXO_STOP) {
+        worker_command_best_effort("stop");
     }
     return 0;
 }

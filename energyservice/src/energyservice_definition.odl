@@ -4,12 +4,12 @@
  */
 
 %define {
-object EnergyService {
+%persistent object EnergyService {
     %persistent bool StartService = false {
         on action write call energyservice_start_service;
     }
 
-    object Config {
+    %persistent object Config {
         %persistent string DbgLevels = "all=1" { on action write call energyservice_sync; }
         %persistent bool Respawn = true { on action write call energyservice_sync; }
         %persistent uint32 WlanIfacesNotUpWait = 10 { on action write call energyservice_sync; }
@@ -17,7 +17,7 @@ object EnergyService {
         %persistent uint32 LogFileSize = 5000 { on action write call energyservice_sync; }
     }
 
-    object Wlanif {
+    %persistent object Wlanif {
         %persistent uint32 AppInitSendDelay = 1 { on action write call energyservice_sync; }
         %persistent uint32 AppInitRetryTimeout = 5 { on action write call energyservice_sync; }
         %persistent uint32 AppInitMaxRetries = 60 { on action write call energyservice_sync; }
@@ -26,7 +26,7 @@ object EnergyService {
         %persistent string NetlinkInterfacePrefixCompareLength = "3" { on action write call energyservice_sync; }
     }
 
-    object Energy {
+    %persistent object Energy {
         %persistent bool Enable = false { on action write call energyservice_sync; }
         %persistent string DbgLevels = "all=1" { on action write call energyservice_sync; }
         %persistent uint32 EnergyServiceMonitoringTimeout = 1 { on action write call energyservice_sync; }
@@ -59,8 +59,8 @@ object EnergyService {
         %persistent bool EnergyServiceLicenseEnabled = false { on action write call energyservice_sync; }
     }
 
-    object Erp {
-        %persistent string DbgLevels = "all=3" { on action write call energyservice_sync; }
+    %persistent object Erp {
+        %persistent string DbgLevels = "all=1" { on action write call energyservice_sync; }
         %persistent uint32 IdlePollPeriod = 60 { on action write call energyservice_sync; }
         %persistent uint32 erp_mode = 2 { on action write call energyservice_sync; }
         %persistent uint32 pon_mode = 0 { on action write call energyservice_sync; }
@@ -75,13 +75,15 @@ object EnergyService {
     /* The complete command must start with "erp cli enter" or "erp cli exit". */
     %volatile string ERPServiceEnter = "" { on action write call energyservice_erp_enter; }
     %volatile string ERPServiceExit = "" { on action write call energyservice_erp_exit; }
+    /* Last ERP command accepted by the ERP CLI. */
+    %persistent %read-only string LastERPServiceCommand = "";
     %persistent uint32 EcoModeEnter = 0 { on action write call energyservice_sync; }
     %persistent uint32 EcoModeExit = 0 { on action write call energyservice_sync; }
 
     /* Runtime ERP status returned by the Energy App CLI. */
     object ERPService {
         /* Query the ERP CLI and return the current status table. */
-        string StatusRefresh() <!import:${name}:_energyservice_status_refresh!>;
+        string Status() <!import:${name}:_energyservice_status!>;
     }
 }
 }
