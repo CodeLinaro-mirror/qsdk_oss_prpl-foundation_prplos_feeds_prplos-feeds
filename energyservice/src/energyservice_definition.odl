@@ -5,6 +5,9 @@
 
 %define {
 %persistent object EnergyService {
+    /* Trace ERP writes before libamxd can skip an unchanged parameter value. */
+    on action write call energyservice_write;
+
     %persistent bool StartService = false {
         on action write call energyservice_start_service;
     }
@@ -73,6 +76,7 @@
 
     /* ERP command/status DMs are intentionally not written to gw_energy_app.conf. */
     /* The complete command must start with "erp cli enter" or "erp cli exit". */
+    /* Command triggers always read back as empty, allowing identical writes. */
     %volatile string ERPServiceEnter = "" { on action write call energyservice_erp_enter; }
     %volatile string ERPServiceExit = "" { on action write call energyservice_erp_exit; }
     /* Last ERP command accepted by the ERP CLI. */

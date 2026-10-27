@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <syslog.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -42,7 +43,11 @@
 #define ERP_CLI_MAX_COMMAND_LENGTH 1024
 #define ERP_CLI_RESPONSE_LENGTH 4096
 #define ERP_STATUS_OUTPUT_LENGTH 1024
+#define ERP_TRACE_TEXT_LENGTH 160
 #define ENERGY_EXPORT __attribute__((visibility("default")))
+
+/* These diagnostics must reach syslog even in builds without SAHTRACES_ENABLED. */
+#define ERP_TRACE(priority, ...) syslog(priority, "EnergyService ERP: " __VA_ARGS__)
 
 typedef enum {
     VALUE_UINT,
@@ -239,7 +244,7 @@ static bool parse_erp_status_buffer(const char* buffer,
                                     size_t length,
                                     erp_status_row_t rows[4]) {
     static const char* const systems[] = {"Overall", "NSS SS", "WiFi SS", "BSP SS"};
-    erp_status_row_t parsed[4] = {{0}};
+    erp_status_row_t parsed[4] = {0};
     bool found[4] = {false, false, false, false};
     char text[16384];
     char* save = NULL;
@@ -391,7 +396,7 @@ static bool prepare_erp_cli_command(const char* input,
 static bool erp_cli_response_has_error(const char* response) {
     static const char* const error_markers[] = {
         "invalid", "unknown", "error", "failed", "failure",
-        "unsupported", "not supported", "usage"
+        "unsupported", "not supported", "not allowed", "usage"
     };
 
     if(response == NULL) {
@@ -405,26 +410,46 @@ static bool erp_cli_response_has_error(const char* response) {
     return false;
 }
 
+/* Keep command/response previews bounded and on one syslog line. */
+static void erp_trace_text(const char* input, char output[ERP_TRACE_TEXT_LENGTH]) {
+    size_t i = 0;
+
+    if(input == NULL) {
+        input = "(null)";
+    }
+    for(; input[i] != '\0' && i < ERP_TRACE_TEXT_LENGTH - 1; i++) {
+        output[i] = isprint((unsigned char) input[i]) ? input[i] : '.';
+    }
+    output[i] = '\0';
+}
+
 static erp_cli_result_t send_erp_cli_command(const char* input,
                                              const char* expected_prefix) {
     struct sockaddr_in address = {0};
     struct timeval timeout = {.tv_sec = ERP_CLI_TIMEOUT_SEC, .tv_usec = 0};
     char command[ERP_CLI_MAX_COMMAND_LENGTH];
     char response[ERP_CLI_RESPONSE_LENGTH];
+    char preview[ERP_TRACE_TEXT_LENGTH];
+    const char* receive_end = "buffer full";
     size_t command_length;
     size_t used = 0;
     int fd = -1;
 
     if(!prepare_erp_cli_command(input, expected_prefix, command)) {
-        SAH_TRACEZ_WARNING(ME, "Invalid ERP CLI command: %s", input == NULL ? "(null)" : input);
+        erp_trace_text(input, preview);
+        ERP_TRACE(LOG_WARNING, "validation failed: expected='%s' input='%s'",
+                  expected_prefix, preview);
         return ERP_CLI_RESULT_INVALID;
     }
     command_length = strlen(command);
+    erp_trace_text(input, preview);
+    ERP_TRACE(LOG_NOTICE, "CLI connect: command='%s' peer=%s:%u",
+              preview, ERP_CLI_ADDRESS, ERP_CLI_PORT);
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if(fd < 0) {
-        SAH_TRACEZ_WARNING(ME, "Cannot create ERP CLI socket for '%s': %s",
-                           command, strerror(errno));
+        ERP_TRACE(LOG_WARNING, "CLI socket failed: command='%s' error=%s",
+                  preview, strerror(errno));
         return ERP_CLI_RESULT_ERROR;
     }
     (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -433,32 +458,34 @@ static erp_cli_result_t send_erp_cli_command(const char* input,
     address.sin_port = htons(ERP_CLI_PORT);
     if(inet_pton(AF_INET, ERP_CLI_ADDRESS, &address.sin_addr) != 1 ||
        connect(fd, (struct sockaddr*) &address, sizeof(address)) != 0) {
-        SAH_TRACEZ_WARNING(ME, "Cannot connect to ERP CLI %s:%u for '%s': %s",
-                           ERP_CLI_ADDRESS, ERP_CLI_PORT, command, strerror(errno));
+        ERP_TRACE(LOG_WARNING, "CLI connect failed: command='%s' error=%s",
+                  preview, strerror(errno));
         close(fd);
         return ERP_CLI_RESULT_ERROR;
     }
 
     for(size_t sent = 0; sent < command_length;) {
-        ssize_t result = send(fd, command + sent, command_length - sent, 0);
+        ssize_t result = send(fd, command + sent, command_length - sent, MSG_NOSIGNAL);
         if(result <= 0) {
-            SAH_TRACEZ_WARNING(ME, "Cannot send ERP CLI command '%s': %s",
-                               command, strerror(errno));
+            ERP_TRACE(LOG_WARNING, "CLI send failed: command='%s' sent=%zu/%zu error=%s",
+                      preview, sent, command_length, strerror(errno));
             close(fd);
             return ERP_CLI_RESULT_ERROR;
         }
         sent += (size_t) result;
     }
+    ERP_TRACE(LOG_NOTICE, "CLI sent: command='%s' bytes=%zu", preview, command_length);
 
     while(used < sizeof(response) - 1) {
         ssize_t result = recv(fd, response + used, sizeof(response) - 1 - used, 0);
         if(result <= 0) {
             if(result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                SAH_TRACEZ_WARNING(ME, "Cannot read ERP CLI response for '%s': %s",
-                                   command, strerror(errno));
+                ERP_TRACE(LOG_WARNING, "CLI receive failed: command='%s' bytes=%zu error=%s",
+                          preview, used, strerror(errno));
                 close(fd);
                 return ERP_CLI_RESULT_ERROR;
             }
+            receive_end = result == 0 ? "peer closed" : "timeout";
             break;
         }
         used += (size_t) result;
@@ -466,11 +493,16 @@ static erp_cli_result_t send_erp_cli_command(const char* input,
     response[used] = '\0';
     close(fd);
 
+    erp_trace_text(response, preview);
+    ERP_TRACE(LOG_NOTICE, "CLI response: operation='%s' bytes=%zu end=%s preview='%s'",
+              expected_prefix, used, receive_end, preview);
     if(erp_cli_response_has_error(response)) {
-        SAH_TRACEZ_WARNING(ME, "ERP CLI rejected command '%s': %s", command, response);
+        ERP_TRACE(LOG_WARNING, "CLI reported an error: operation='%s'", expected_prefix);
         return ERP_CLI_RESULT_INVALID;
     }
-    SAH_TRACEZ_INFO(ME, "ERP CLI command accepted: %s", command);
+    /* A prompt or timeout is not proof that the asynchronous transition completed. */
+    ERP_TRACE(LOG_NOTICE, "CLI dispatch finished: operation='%s'; query ERP status for completion",
+              expected_prefix);
     return ERP_CLI_RESULT_OK;
 }
 
@@ -641,7 +673,7 @@ static void store_last_erp_command(const char* command) {
     amxd_status_t status = amxd_status_unknown_error;
 
     if(root == NULL || command == NULL) {
-        SAH_TRACEZ_WARNING(ME, "Failed to store the last ERP command");
+        ERP_TRACE(LOG_WARNING, "Failed to store the last ERP command");
         return;
     }
 
@@ -669,7 +701,7 @@ static void store_last_erp_command(const char* command) {
     amxc_var_clean(&old_values);
     amxc_var_clean(&value);
     if(status != amxd_status_ok) {
-        SAH_TRACEZ_WARNING(ME, "Failed to store the last ERP command (status %d)", status);
+        ERP_TRACE(LOG_WARNING, "Failed to store the last ERP command (status %d)", status);
     }
 }
 
@@ -713,6 +745,50 @@ ENERGY_EXPORT amxd_status_t _energyservice_sync(amxd_object_t* object,
     return write_config(energy_root()) ? amxd_status_ok : amxd_status_unknown_error;
 }
 
+ENERGY_EXPORT amxd_status_t _energyservice_write(amxd_object_t* object,
+                                                amxd_param_t* parameter,
+                                                amxd_action_t reason,
+                                                const amxc_var_t* const args,
+                                                amxc_var_t* const retval,
+                                                void* priv) {
+    static const char* const names[] = {"ERPServiceEnter", "ERPServiceExit"};
+    static const char* const groups[] = {"parameters", "oparameters"};
+    bool has_erp_request = false;
+    amxd_status_t status;
+
+    if(reason == action_object_write && args != NULL) {
+        for(size_t group = 0; group < sizeof(groups) / sizeof(groups[0]); group++) {
+            const amxc_var_t* values = GET_ARG(args, groups[group]);
+            for(size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+                const amxc_var_t* incoming = GET_ARG(values, names[i]);
+                const amxc_var_t* stored;
+                char incoming_text[ERP_TRACE_TEXT_LENGTH];
+                char stored_text[ERP_TRACE_TEXT_LENGTH];
+                int comparison = -1;
+                bool same;
+
+                if(incoming == NULL) {
+                    continue;
+                }
+                has_erp_request = true;
+                stored = amxd_object_get_param_value(object, names[i]);
+                same = stored != NULL &&
+                       amxc_var_compare(incoming, stored, &comparison) == 0 && comparison == 0;
+                erp_trace_text(amxc_var_constcast(cstring_t, incoming), incoming_text);
+                erp_trace_text(amxc_var_constcast(cstring_t, stored), stored_text);
+                ERP_TRACE(LOG_NOTICE, "DM write: parameter=%s incoming='%s' stored='%s' same=%d%s",
+                          names[i], incoming_text, stored_text, same,
+                          same ? " (libamxd will skip the parameter callback)" : "");
+            }
+        }
+    }
+    status = amxd_action_object_write(object, parameter, reason, args, retval, priv);
+    if(has_erp_request) {
+        ERP_TRACE(LOG_NOTICE, "DM write finished: status=%d", status);
+    }
+    return status;
+}
+
 static amxd_status_t execute_erp_cli_parameter(amxd_object_t* object,
                                                amxd_param_t* parameter,
                                                amxd_action_t reason,
@@ -721,29 +797,50 @@ static amxd_status_t execute_erp_cli_parameter(amxd_object_t* object,
                                                void* priv,
                                                const char* expected_prefix) {
     const char* command;
-    amxd_status_t status;
     erp_cli_result_t result;
 
+    (void) retval;
+    (void) priv;
+    ERP_TRACE(LOG_NOTICE, "callback: parameter=%s reason=%d operation='%s'",
+              parameter == NULL ? "(null)" : amxd_param_get_name(parameter),
+              reason, expected_prefix);
+    if(reason != action_param_write) {
+        ERP_TRACE(LOG_WARNING, "callback ignored: not a parameter write");
+        return amxd_status_function_not_implemented;
+    }
+    if(object == NULL || parameter == NULL) {
+        ERP_TRACE(LOG_WARNING, "callback rejected: missing object or parameter");
+        return amxd_status_invalid_value;
+    }
     if(args == NULL || expected_prefix == NULL) {
+        ERP_TRACE(LOG_WARNING, "callback rejected: missing command");
         return amxd_status_invalid_value;
     }
     command = amxc_var_constcast(cstring_t, args);
     if(command == NULL) {
+        ERP_TRACE(LOG_WARNING, "callback rejected: command is not a string");
         return amxd_status_invalid_value;
     }
     result = send_erp_cli_command(command, expected_prefix);
     if(result == ERP_CLI_RESULT_INVALID) {
+        ERP_TRACE(LOG_WARNING, "callback finished: invalid command/CLI rejection");
         return amxd_status_invalid_value;
     }
     if(result != ERP_CLI_RESULT_OK) {
+        ERP_TRACE(LOG_WARNING, "callback finished: CLI transport failure");
         return amxd_status_unknown_error;
     }
 
-    status = amxd_action_param_write(object, parameter, reason, args, retval, priv);
-    if(status == amxd_status_ok) {
-        store_last_erp_command(command);
-    }
-    return status;
+    /*
+     * This is a command trigger, not stored configuration. Keep the default
+     * empty value: amxd_param_set_value() skips action_param_write entirely
+     * when the requested string equals the stored value. Storing the command
+     * here would therefore prevent all subsequent identical invocations.
+     */
+    store_last_erp_command(command);
+    ERP_TRACE(LOG_NOTICE, "callback finished: parameter=%s status=0; trigger remains empty",
+              amxd_param_get_name(parameter));
+    return amxd_status_ok;
 }
 
 ENERGY_EXPORT amxd_status_t _energyservice_erp_enter(amxd_object_t* object,
@@ -770,7 +867,7 @@ ENERGY_EXPORT amxd_status_t _energyservice_status(amxd_object_t* object,
                                              amxd_function_t* function,
                                              amxc_var_t* args,
                                              amxc_var_t* retval) {
-    erp_status_row_t rows[4] = {{0}};
+    erp_status_row_t rows[4] = {0};
     char output[ERP_STATUS_OUTPUT_LENGTH];
 
     (void) object;
