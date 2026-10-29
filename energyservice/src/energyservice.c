@@ -43,6 +43,8 @@
 #define ERP_CLI_MAX_COMMAND_LENGTH 1024
 #define ERP_CLI_RESPONSE_LENGTH 4096
 #define ERP_STATUS_OUTPUT_LENGTH 1024
+#define ERP_STATUS_REQUIRED_ROWS 4
+#define ERP_STATUS_MAX_ROWS 5
 #define ERP_TRACE_TEXT_LENGTH 160
 #define ENERGY_EXPORT __attribute__((visibility("default")))
 
@@ -67,6 +69,10 @@ typedef struct {
     uint32_t enter_count;
     uint32_t exit_count;
 } erp_status_row_t;
+
+static const char* const erp_status_systems[ERP_STATUS_MAX_ROWS] = {
+    "Overall", "NSS SS", "WiFi SS", "BSP SS", "Fontana"
+};
 
 static amxd_dm_t* energy_dm;
 
@@ -242,14 +248,12 @@ static bool parse_erp_status_row(const char* line,
 
 static bool parse_erp_status_buffer(const char* buffer,
                                     size_t length,
-                                    erp_status_row_t rows[4]) {
-    static const char* const systems[] = {"Overall", "NSS SS", "WiFi SS", "BSP SS"};
-    erp_status_row_t parsed[4] = {0};
-    bool found[4] = {false, false, false, false};
+                                    erp_status_row_t rows[ERP_STATUS_MAX_ROWS]) {
+    erp_status_row_t parsed[ERP_STATUS_MAX_ROWS] = {0};
+    bool found[ERP_STATUS_MAX_ROWS] = {false};
     char text[16384];
     char* save = NULL;
     char* line;
-    bool complete = true;
 
     if(buffer == NULL || rows == NULL || length >= sizeof(text)) {
         return false;
@@ -259,27 +263,34 @@ static bool parse_erp_status_buffer(const char* buffer,
 
     line = strtok_r(text, "\r\n", &save);
     while(line != NULL) {
-        for(size_t i = 0; i < sizeof(systems) / sizeof(systems[0]); i++) {
-            if(!found[i] && parse_erp_status_row(line, systems[i], &parsed[i])) {
+        for(size_t i = 0; i < ERP_STATUS_MAX_ROWS; i++) {
+            erp_status_row_t row = {0};
+            if(!found[i] && parse_erp_status_row(line, erp_status_systems[i], &row)) {
+                parsed[i] = row;
                 found[i] = true;
             }
         }
         line = strtok_r(NULL, "\r\n", &save);
     }
 
-    for(size_t i = 0; i < sizeof(found) / sizeof(found[0]); i++) {
+    for(size_t i = 0; i < ERP_STATUS_REQUIRED_ROWS; i++) {
         if(!found[i]) {
-            complete = false;
-            break;
+            return false;
         }
     }
-    if(complete) {
-        memcpy(rows, parsed, sizeof(parsed));
-    }
-    return complete;
+    /* An absent Fontana row stays empty; only the four standard rows are required. */
+    memcpy(rows, parsed, sizeof(parsed));
+    return true;
 }
 
-static bool query_erp_status(erp_status_row_t rows[4]) {
+static bool erp_status_has_final_prompt(const char* response, size_t length) {
+    /* A root CLI prompt is '@ ' on the line following the last status row. */
+    return length >= 3 &&
+           (response[length - 3] == '\n' || response[length - 3] == '\r') &&
+           response[length - 2] == '@' && response[length - 1] == ' ';
+}
+
+static bool query_erp_status(erp_status_row_t rows[ERP_STATUS_MAX_ROWS]) {
     struct sockaddr_in address = {0};
     struct timeval timeout = {.tv_sec = ERP_CLI_TIMEOUT_SEC, .tv_usec = 0};
     const char command[] = "erp cli status\r\n";
@@ -322,7 +333,9 @@ static bool query_erp_status(erp_status_row_t rows[4]) {
             break;
         }
         used += (size_t) result;
-        if(parse_erp_status_buffer(response, used, rows)) {
+        /* Four rows alone are not the end: Fontana may arrive in a later read. */
+        if(erp_status_has_final_prompt(response, used) &&
+           parse_erp_status_buffer(response, used, rows)) {
             complete = true;
             break;
         }
@@ -506,7 +519,7 @@ static erp_cli_result_t send_erp_cli_command(const char* input,
     return ERP_CLI_RESULT_OK;
 }
 
-static bool refresh_erp_status(erp_status_row_t rows[4]) {
+static bool refresh_erp_status(erp_status_row_t rows[ERP_STATUS_MAX_ROWS]) {
     if(rows == NULL) {
         return false;
     }
@@ -518,9 +531,8 @@ static bool refresh_erp_status(erp_status_row_t rows[4]) {
     return true;
 }
 
-static bool format_erp_status(const erp_status_row_t rows[4],
+static bool format_erp_status(const erp_status_row_t rows[ERP_STATUS_MAX_ROWS],
                               char output[ERP_STATUS_OUTPUT_LENGTH]) {
-    static const char* const systems[] = {"Overall", "NSS SS", "WiFi SS", "BSP SS"};
     int written;
 
     if(rows == NULL || output == NULL) {
@@ -533,11 +545,14 @@ static bool format_erp_status(const erp_status_row_t rows[4],
     if(written < 0 || written >= ERP_STATUS_OUTPUT_LENGTH) {
         return false;
     }
-    for(size_t i = 0; i < 4; i++) {
+    for(size_t i = 0; i < ERP_STATUS_MAX_ROWS; i++) {
+        if(i >= ERP_STATUS_REQUIRED_ROWS && rows[i].status[0] == '\0') {
+            continue;
+        }
         int added = snprintf(output + written,
                              ERP_STATUS_OUTPUT_LENGTH - (size_t) written,
                              "%-20s%-21s%-17s%-17s%-13u%u\n",
-                             systems[i], rows[i].status, rows[i].avg_enter_time,
+                             erp_status_systems[i], rows[i].status, rows[i].avg_enter_time,
                              rows[i].avg_exit_time, rows[i].enter_count,
                              rows[i].exit_count);
         if(added < 0 || (size_t) added >= ERP_STATUS_OUTPUT_LENGTH - (size_t) written) {
@@ -867,7 +882,7 @@ ENERGY_EXPORT amxd_status_t _energyservice_status(amxd_object_t* object,
                                              amxd_function_t* function,
                                              amxc_var_t* args,
                                              amxc_var_t* retval) {
-    erp_status_row_t rows[4] = {0};
+    erp_status_row_t rows[ERP_STATUS_MAX_ROWS] = {0};
     char output[ERP_STATUS_OUTPUT_LENGTH];
 
     (void) object;
